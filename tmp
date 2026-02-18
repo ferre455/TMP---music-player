@@ -6,187 +6,175 @@ import socket
 import json
 import time
 import tempfile
+import random
 
+# ---------- CONFIGURATION ----------
 MUSIC_DIR = os.path.expanduser("~/Music")
 SUPPORTED = (".mp3", ".wav", ".flac", ".ogg", ".m4a")
-TIME_INTERVAL = 1.0  # seconds
 
 PLAYER_PROC = None
 IPC_PATH = None
 
-
-# ---------- FILES ----------
 def get_music_files():
     try:
-        return sorted(
-            f for f in os.listdir(MUSIC_DIR)
-            if f.lower().endswith(SUPPORTED)
-        )
-    except FileNotFoundError:
+        return sorted([f for f in os.listdir(MUSIC_DIR) if f.lower().endswith(SUPPORTED)])
+    except:
         return []
 
-
-# ---------- MPV ----------
 def stop_player():
     global PLAYER_PROC, IPC_PATH
     if PLAYER_PROC:
         PLAYER_PROC.terminate()
         PLAYER_PROC = None
     if IPC_PATH and os.path.exists(IPC_PATH):
-        os.remove(IPC_PATH)
+        try: os.remove(IPC_PATH)
+        except: pass
     IPC_PATH = None
-
-
-def wait_for_ipc(path, timeout=1.0):
-    start = time.time()
-    while time.time() - start < timeout:
-        if os.path.exists(path):
-            return True
-        time.sleep(0.02)
-    return False
-
 
 def start_player(filepath):
     global PLAYER_PROC, IPC_PATH
     stop_player()
-
     IPC_PATH = tempfile.mktemp(prefix="mpv-socket-")
 
     PLAYER_PROC = subprocess.Popen(
         [
             "mpv",
-            "--no-video",
             f"--input-ipc-server={IPC_PATH}",
+            "--geometry=300x300-20+20",
+            "--autofit=300x300",
+            "--ontop",
+            "--force-window=immediate",
+            "--title=MusicPlayer-Cover",
             filepath,
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
 
-    if not wait_for_ipc(IPC_PATH):
-        stop_player()
-
-
 def mpv_command(command):
-    if not IPC_PATH or not os.path.exists(IPC_PATH):
-        return None
+    if not IPC_PATH or not os.path.exists(IPC_PATH): return None
     try:
         with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(0.05)
             s.connect(IPC_PATH)
             s.sendall((json.dumps(command) + "\n").encode())
-            data = s.recv(4096)
-            return json.loads(data.decode())
-    except Exception:
+            return json.loads(s.recv(4096).decode())
+    except:
         return None
-
-
-def toggle_pause():
-    mpv_command({"command": ["cycle", "pause"]})
-
 
 def get_property(prop):
     resp = mpv_command({"command": ["get_property", prop]})
-    if resp and "data" in resp:
-        return resp["data"]
-    return None
-
-
-# ---------- UI ----------
-def compute_remaining_time():
-    pos = get_property("time-pos")
-    dur = get_property("duration")
-    if not pos or not dur:
-        return ""
-
-    remaining = max(0, int(dur - pos))
-    mins = remaining // 60
-    secs = remaining % 60
-    return f"Time remaining: -{mins:02}:{secs:02}"
-
+    return resp["data"] if resp and "data" in resp else None
 
 def draw(stdscr, files, selected, offset, time_str):
     stdscr.erase()
     h, w = stdscr.getmaxyx()
+    stdscr.addstr(1, (w - 12) // 2, "Music Player", curses.A_BOLD)
+    stdscr.addstr(2, 2, "─" * (w - 4))
 
-    title = "Music Player"
-    stdscr.addstr(1, (w - len(title)) // 2, title)
-    stdscr.addstr(2, 2, "-" * (w - 4))
-
-    visible = h - 9
-    for i in range(visible):
+    visible_count = h - 8
+    for i in range(visible_count):
         idx = offset + i
-        if idx >= len(files):
-            break
-        prefix = "> " if idx == selected else "  "
-        line = prefix + files[idx]
-        stdscr.addstr(4 + i, 4, line[: w - 8])
+        if idx >= len(files): break
+        if idx == selected:
+            stdscr.attron(curses.A_REVERSE)
+            stdscr.addstr(4 + i, 2, f" > {files[idx]}"[:w-4])
+            stdscr.attroff(curses.A_REVERSE)
+        else:
+            stdscr.addstr(4 + i, 2, f"   {files[idx]}"[:w-4])
 
-    # Always draw cached time string (prevents flicker)
     if time_str:
         stdscr.addstr(h - 4, 2, time_str.ljust(w - 4))
+    
+    footer = "↑↓ Move | Enter Play | Space Pause | s Shuffle | +/- Vol | ←→ Prev/Next | q Quit"
+    stdscr.addstr(h - 2, 2, footer[:w-4], curses.A_DIM)
+    stdscr.refresh()
 
-    footer = "↑↓ Move  Enter Play  Space Pause  ←→ Prev/Next  q Quit"
-    stdscr.addstr(h - 2, 2, footer[: w - 4])
-
-    stdscr.noutrefresh()
-    curses.doupdate()
-
-
-# ---------- MAIN ----------
 def main(stdscr):
     curses.curs_set(0)
+    curses.noecho()
     stdscr.keypad(True)
     stdscr.timeout(100)
-
+    
     files = get_music_files()
-    if not files:
-        stdscr.addstr(0, 0, "No music files found in ~/Music")
-        stdscr.refresh()
-        stdscr.getch()
-        return
+    if not files: return
 
     selected = 0
     offset = 0
-    last_time_update = 0
-    cached_time_str = ""
+    is_playing = False
+    last_status_check = 0
+    last_start_time = 0 
+    none_count = 0
+    cached_time = ""
 
     while True:
-        h, _ = stdscr.getmaxyx()
-        visible = h - 9
+        h, w = stdscr.getmaxyx()
+        list_height = h - 8
 
-        if selected < offset:
+        # Correct Scrolling logic
+        if selected < offset: 
             offset = selected
-        elif selected >= offset + visible:
-            offset = selected - visible + 1
+        elif selected >= offset + list_height: 
+            offset = selected - list_height + 1
 
         now = time.time()
-        if now - last_time_update >= TIME_INTERVAL:
-            cached_time_str = compute_remaining_time()
-            last_time_update = now
+        if now - last_status_check > 0.5:
+            pos = get_property("time-pos")
+            dur = get_property("duration")
+            
+            if pos is not None and dur is not None:
+                none_count = 0
+                rem = max(0, int(dur - pos))
+                cached_time = f"Time remaining: -{rem//60:02}:{rem%60:02}"
+            else:
+                if is_playing and (now - last_start_time > 2.0):
+                    none_count += 1
+                    if none_count >= 3:
+                        if selected < len(files) - 1:
+                            selected += 1 # Move to next track automatically
+                            start_player(os.path.join(MUSIC_DIR, files[selected]))
+                            last_start_time = now
+                            none_count = 0
+                        else:
+                            is_playing = False
+                cached_time = ""
+            last_status_check = now
 
-        draw(stdscr, files, selected, offset, cached_time_str)
-
-        key = stdscr.getch()
-        if key == curses.KEY_UP and selected > 0:
-            selected -= 1
-        elif key == curses.KEY_DOWN and selected < len(files) - 1:
-            selected += 1
-        elif key in (10, 13):
-            start_player(os.path.join(MUSIC_DIR, files[selected]))
-            cached_time_str = ""
-        elif key == ord(" "):
-            toggle_pause()
-        elif key == curses.KEY_RIGHT and selected < len(files) - 1:
-            selected += 1
-            start_player(os.path.join(MUSIC_DIR, files[selected]))
-            cached_time_str = ""
-        elif key == curses.KEY_LEFT and selected > 0:
-            selected -= 1
-            start_player(os.path.join(MUSIC_DIR, files[selected]))
-            cached_time_str = ""
-        elif key == ord("q"):
+        draw(stdscr, files, selected, offset, cached_time)
+        
+        ch = stdscr.getch()
+        if ch == ord('q'): 
             break
-
+        elif ch == curses.KEY_UP and selected > 0: 
+            selected -= 1
+        elif ch == curses.KEY_DOWN and selected < len(files) - 1: 
+            selected += 1
+        elif ch == ord('s'):
+            random.shuffle(files)
+            selected, offset = 0, 0
+        elif ch in (10, 13): 
+            start_player(os.path.join(MUSIC_DIR, files[selected]))
+            is_playing, last_start_time, none_count = True, now, 0
+        elif ch == ord(' '): 
+            mpv_command({"command": ["cycle", "pause"]})
+        elif ch == ord('+'):
+            mpv_command({"command": ["add", "volume", 5]})
+        elif ch == ord('-'):
+            mpv_command({"command": ["add", "volume", -5]})
+            
+        # CORRECTED PREV/NEXT MAPPING
+        elif ch == curses.KEY_RIGHT: # Next Song
+            if selected < len(files) - 1:
+                selected += 1
+                start_player(os.path.join(MUSIC_DIR, files[selected]))
+                is_playing, last_start_time, none_count = True, now, 0
+        elif ch == curses.KEY_LEFT: # Previous Song
+            if selected > 0:
+                selected -= 1
+                start_player(os.path.join(MUSIC_DIR, files[selected]))
+                is_playing, last_start_time, none_count = True, now, 0
+        
+        time.sleep(0.01)
 
 if __name__ == "__main__":
     try:
