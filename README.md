@@ -51,7 +51,7 @@ cd TMP---music-player
 Run the player:
 
 ```sh
-python3 tnmupdate.py
+python3 tmp.py
 
 ```
 
